@@ -19,6 +19,7 @@
  *
  */
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,15 @@
 
 struct ioplug_data {
 	snd_pcm_ioplug_t io;
+
+	pthread_mutex_t mutex;
+	/* currently used PCM */
+	snd_pcm_t *pcm;
+
+	/* configuration passed to this plug-in */
+	snd_pcm_hw_params_t *hw_params;
+	snd_pcm_sw_params_t *sw_params;
+
 };
 
 static int cb_start(snd_pcm_ioplug_t *io) {
@@ -63,12 +73,23 @@ static snd_pcm_sframes_t cb_transfer(snd_pcm_ioplug_t *io,
 static int cb_close(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
+
+	pthread_mutex_lock(&ioplug->mutex);
+	if (ioplug->pcm != NULL)
+		snd_pcm_close(ioplug->pcm);
+	pthread_mutex_unlock(&ioplug->mutex);
+
+	snd_pcm_sw_params_free(ioplug->sw_params);
+	snd_pcm_hw_params_free(ioplug->hw_params);
+	pthread_mutex_destroy(&ioplug->mutex);
+	free(ioplug);
 	return 0;
 }
 
 static int cb_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug("params=%p", params);
+	snd_pcm_hw_params_copy(ioplug->hw_params, params);
 	return 0;
 }
 
@@ -81,6 +102,7 @@ static int cb_hw_free(snd_pcm_ioplug_t *io) {
 static int cb_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug("params=%p", params);
+	snd_pcm_sw_params_copy(ioplug->sw_params, params);
 	return 0;
 }
 
@@ -93,25 +115,46 @@ static int cb_prepare(snd_pcm_ioplug_t *io) {
 static int cb_drain(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
-	return 0;
+	int rv = 0;
+	pthread_mutex_lock(&ioplug->mutex);
+	if (ioplug->pcm != NULL)
+		rv = snd_pcm_drain(ioplug->pcm);
+	pthread_mutex_unlock(&ioplug->mutex);
+	return rv;
 }
 
 static int cb_pause(snd_pcm_ioplug_t *io, int enable) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug("enable=%d", enable);
-	return 0;
+	int rv = 0;
+	pthread_mutex_lock(&ioplug->mutex);
+	if (ioplug->pcm != NULL)
+		rv = snd_pcm_pause(ioplug->pcm, enable);
+	pthread_mutex_unlock(&ioplug->mutex);
+	return rv;
 }
 
 static int cb_resume(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
-	return 0;
+	int rv = 0;
+	pthread_mutex_lock(&ioplug->mutex);
+	if (ioplug->pcm != NULL)
+		rv = snd_pcm_resume(ioplug->pcm);
+	pthread_mutex_unlock(&ioplug->mutex);
+	return rv;
 }
 
 static int cb_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug("delay=%p", delayp);
-	return 0;
+	int rv = 0;
+	*delayp = 0;
+	pthread_mutex_lock(&ioplug->mutex);
+	if (ioplug->pcm != NULL)
+		rv = snd_pcm_delay(ioplug->pcm, delayp);
+	pthread_mutex_unlock(&ioplug->mutex);
+	return rv;
 }
 
 static int cb_poll_descriptors_count(snd_pcm_ioplug_t *io) {
@@ -155,6 +198,10 @@ static int cb_set_chmap(snd_pcm_ioplug_t *io, const snd_pcm_chmap_t *map) {
 static void cb_dump(snd_pcm_ioplug_t *io, snd_output_t *out) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug("out=%p", out);
+	pthread_mutex_lock(&ioplug->mutex);
+	if (ioplug->pcm != NULL)
+		snd_pcm_dump(ioplug->pcm, out);
+	pthread_mutex_unlock(&ioplug->mutex);
 }
 
 static const snd_pcm_ioplug_callback_t callback = {
@@ -212,6 +259,13 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	ioplug->io.callback = &callback;
 	ioplug->io.private_data = ioplug;
 
+	pthread_mutex_init(&ioplug->mutex, NULL);
+
+	if ((ret = snd_pcm_hw_params_malloc(&ioplug->hw_params)) < 0)
+		goto fail;
+	if ((ret = snd_pcm_sw_params_malloc(&ioplug->sw_params)) < 0)
+		goto fail;
+
 	debug("Creating IO plug: ioplug=%p name=%s stream=%d mode=%d",
 			ioplug, name, stream, mode);
 	if ((ret = snd_pcm_ioplug_create(&ioplug->io, name, stream, mode)) < 0)
@@ -221,6 +275,9 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	return 0;
 
 fail:
+	snd_pcm_sw_params_free(ioplug->sw_params);
+	snd_pcm_hw_params_free(ioplug->hw_params);
+	pthread_mutex_destroy(&ioplug->mutex);
 	free(ioplug);
 	return ret;
 }
