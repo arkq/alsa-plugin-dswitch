@@ -19,11 +19,15 @@
  *
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
+
+#define debug(M, ...) \
+	fprintf(stderr, "%s:%u: " M "\n", __func__, __LINE__, ##__VA_ARGS__)
 
 struct ioplug_data {
 	snd_pcm_ioplug_t io;
@@ -31,105 +35,126 @@ struct ioplug_data {
 
 static int cb_start(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug();
 	return 0;
 }
 
 static int cb_stop(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug();
 	return 0;
 }
 
 static snd_pcm_sframes_t cb_pointer(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug();
 	return 0;
 }
 
 static snd_pcm_sframes_t cb_transfer(snd_pcm_ioplug_t *io,
-		const snd_pcm_channel_area_t *areas, snd_pcm_uframes_t offset,
-		snd_pcm_uframes_t size) {
+		const snd_pcm_channel_area_t *area, snd_pcm_uframes_t offset,
+		snd_pcm_uframes_t frames) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug("area.addr=%p area.first=%u area.step=%u offset=%zu frames=%zu",
+			area->addr, area->first, area->step, offset, frames);
 	return 0;
 }
 
 static int cb_close(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug();
 	return 0;
 }
 
 static int cb_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug("params=%p", params);
 	return 0;
 }
 
 static int cb_hw_free(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug();
 	return 0;
 }
 
 static int cb_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug("params=%p", params);
 	return 0;
 }
 
 static int cb_prepare(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug();
 	return 0;
 }
 
 static int cb_drain(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug();
 	return 0;
 }
 
 static int cb_pause(snd_pcm_ioplug_t *io, int enable) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug("enable=%d", enable);
 	return 0;
 }
 
 static int cb_resume(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug();
 	return 0;
 }
 
 static int cb_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug("delay=%p", delayp);
 	return 0;
 }
 
 static int cb_poll_descriptors_count(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug();
 	return 0;
 }
 
 static int cb_poll_descriptors(snd_pcm_ioplug_t *io,
 		struct pollfd *pfds, unsigned int nfds) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug("pfds=%p nfds=%u", pfds, nfds);
 	return 0;
 }
 
 static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 		struct pollfd *pfds, unsigned int nfds, unsigned short *revents) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug("pfds=%p nfds=%u revents=%p", pfds, nfds, revents);
 	return 0;
 }
 
 static snd_pcm_chmap_query_t **cb_query_chmaps(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug();
 	return NULL;
 }
 
 static snd_pcm_chmap_t *cb_get_chmap(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug();
 	return NULL;
 }
 
 static int cb_set_chmap(snd_pcm_ioplug_t *io, const snd_pcm_chmap_t *map) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug("map=%p", map);
 	return 0;
 }
 
 static void cb_dump(snd_pcm_ioplug_t *io, snd_output_t *out) {
 	struct ioplug_data *ioplug = io->private_data;
+	debug("out=%p", out);
 }
 
 static const snd_pcm_ioplug_callback_t callback = {
@@ -187,6 +212,8 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	ioplug->io.callback = &callback;
 	ioplug->io.private_data = ioplug;
 
+	debug("Creating IO plug: ioplug=%p name=%s stream=%d mode=%d",
+			ioplug, name, stream, mode);
 	if ((ret = snd_pcm_ioplug_create(&ioplug->io, name, stream, mode)) < 0)
 		goto fail;
 
