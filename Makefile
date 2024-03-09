@@ -9,4 +9,4 @@ clean:
 	rm -f $(LIBNAME)
 
 $(LIBNAME): $(SOURCES)
-	$(CC) -shared -fPIC -DPIC -o $@ $^ -lasound
+	$(CC) $(CFLAGS) -shared -fPIC -DPIC -o $@ $^ -lasound
