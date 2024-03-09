@@ -40,6 +40,13 @@ struct ioplug_data {
 	/* configuration passed to this plug-in */
 	snd_pcm_hw_params_t *hw_params;
 	snd_pcm_sw_params_t *sw_params;
+	snd_pcm_format_t hw_format;
+
+	/* fake ring buffer to make IO-plug happy */
+	snd_pcm_channel_area_t io_hw_area;
+	snd_pcm_uframes_t io_hw_boundary;
+	snd_pcm_uframes_t io_hw_ptr;
+	snd_pcm_uframes_t io_appl_ptr;
 
 };
 
@@ -57,8 +64,8 @@ static int cb_stop(snd_pcm_ioplug_t *io) {
 
 static snd_pcm_sframes_t cb_pointer(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
-	debug();
-	return 0;
+	debug("appl=%zu hw=%zu", ioplug->io_appl_ptr, ioplug->io_hw_ptr);
+	return ioplug->io_hw_ptr;
 }
 
 static snd_pcm_sframes_t cb_transfer(snd_pcm_ioplug_t *io,
@@ -67,7 +74,21 @@ static snd_pcm_sframes_t cb_transfer(snd_pcm_ioplug_t *io,
 	struct ioplug_data *ioplug = io->private_data;
 	debug("area.addr=%p area.first=%u area.step=%u offset=%zu frames=%zu",
 			area->addr, area->first, area->step, offset, frames);
-	return 0;
+
+	pthread_mutex_lock(&ioplug->mutex);
+
+	if (ioplug->pcm == NULL) {
+		/* If target PCM is not opened yet, store incoming frames
+		 * in our local ring buffer. */
+		snd_pcm_area_copy(&ioplug->io_hw_area, ioplug->io_appl_ptr,
+		      area, offset, frames, ioplug->hw_format);
+		ioplug->io_appl_ptr += frames;
+		goto final;
+	}
+
+final:
+	pthread_mutex_unlock(&ioplug->mutex);
+	return frames;
 }
 
 static int cb_close(snd_pcm_ioplug_t *io) {
@@ -88,21 +109,48 @@ static int cb_close(snd_pcm_ioplug_t *io) {
 
 static int cb_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params) {
 	struct ioplug_data *ioplug = io->private_data;
-	debug("params=%p", params);
+
+	snd_pcm_format_t format;
+	snd_pcm_uframes_t size;
+	unsigned int channels;
+	unsigned int periods;
+	int rv;
+
 	snd_pcm_hw_params_copy(ioplug->hw_params, params);
+
+	if ((rv = snd_pcm_hw_params_get_format(params, &format)) < 0)
+		return rv;
+	if ((rv = snd_pcm_hw_params_get_channels(params, &channels)) < 0)
+		return rv;
+	if ((rv = snd_pcm_hw_params_get_periods(params, &periods, NULL)) < 0)
+		return rv;
+	if ((rv = snd_pcm_hw_params_get_buffer_size(params, &size)) < 0)
+		return rv;
+
+	debug("hw.format=%u hw.channels=%u hw.periods=%u hw.buffer-size=%zu",
+			format, channels, periods, size);
+
+	ioplug->hw_format = format;
+	ioplug->io_hw_boundary = size;
+	ioplug->io_hw_area.addr = malloc(snd_pcm_format_size(format, size * channels));
+	ioplug->io_hw_area.step = snd_pcm_format_width(format) * channels;
+	ioplug->io_hw_area.first = 0;
+
 	return 0;
 }
 
 static int cb_hw_free(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
+	free(ioplug->io_hw_area.addr);
+	ioplug->io_hw_boundary = 0;
 	return 0;
 }
 
 static int cb_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params) {
 	struct ioplug_data *ioplug = io->private_data;
-	debug("params=%p", params);
 	snd_pcm_sw_params_copy(ioplug->sw_params, params);
+	debug("params=%p", params);
 	return 0;
 }
 
@@ -227,11 +275,51 @@ static const snd_pcm_ioplug_callback_t callback = {
 	.dump = cb_dump,
 };
 
+static int set_hw_constraint(struct ioplug_data *ioplug) {
+	snd_pcm_ioplug_t *io = &ioplug->io;
+
+	static const snd_pcm_access_t accesses[] = {
+		SND_PCM_ACCESS_MMAP_INTERLEAVED,
+		SND_PCM_ACCESS_RW_INTERLEAVED,
+	};
+
+	static const unsigned int formats[] = {
+		SND_PCM_FORMAT_U8,
+		SND_PCM_FORMAT_A_LAW,
+		SND_PCM_FORMAT_MU_LAW,
+		SND_PCM_FORMAT_S16_LE,
+		SND_PCM_FORMAT_S16_BE,
+		SND_PCM_FORMAT_S24_3LE,
+		SND_PCM_FORMAT_S24_3BE,
+		SND_PCM_FORMAT_S24_LE,
+		SND_PCM_FORMAT_S24_BE,
+		SND_PCM_FORMAT_S32_LE,
+		SND_PCM_FORMAT_S32_BE,
+		SND_PCM_FORMAT_FLOAT_LE,
+		SND_PCM_FORMAT_FLOAT_BE,
+	};
+
+	int rv;
+
+	if ((rv = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_ACCESS,
+			sizeof(accesses) / sizeof(accesses[0]), accesses)) < 0)
+		goto final;
+	if ((rv = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_FORMAT,
+			sizeof(formats) / sizeof(formats[0]), formats)) < 0)
+		goto final;
+	if ((rv = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_PERIODS,
+			2, 1024)) < 0)
+		goto final;
+
+final:
+	return rv;
+}
+
 SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	(void)root;
 
 	struct ioplug_data *ioplug;
-	int ret;
+	int rv;
 
 	snd_config_iterator_t pos, next;
 	snd_config_for_each(pos, next, conf) {
@@ -261,25 +349,29 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 
 	pthread_mutex_init(&ioplug->mutex, NULL);
 
-	if ((ret = snd_pcm_hw_params_malloc(&ioplug->hw_params)) < 0)
+	if ((rv = snd_pcm_hw_params_malloc(&ioplug->hw_params)) < 0)
 		goto fail;
-	if ((ret = snd_pcm_sw_params_malloc(&ioplug->sw_params)) < 0)
+	if ((rv = snd_pcm_sw_params_malloc(&ioplug->sw_params)) < 0)
 		goto fail;
 
 	debug("Creating IO plug: ioplug=%p name=%s stream=%d mode=%d",
 			ioplug, name, stream, mode);
-	if ((ret = snd_pcm_ioplug_create(&ioplug->io, name, stream, mode)) < 0)
+	if ((rv = snd_pcm_ioplug_create(&ioplug->io, name, stream, mode)) < 0)
+		goto fail;
+	if ((rv = set_hw_constraint(ioplug)) < 0)
 		goto fail;
 
 	*pcmp = ioplug->io.pcm;
 	return 0;
 
 fail:
+	if (ioplug->io.pcm != NULL)
+		snd_pcm_ioplug_delete(&ioplug->io);
 	snd_pcm_sw_params_free(ioplug->sw_params);
 	snd_pcm_hw_params_free(ioplug->hw_params);
 	pthread_mutex_destroy(&ioplug->mutex);
 	free(ioplug);
-	return ret;
+	return rv;
 }
 
 SND_PCM_PLUGIN_SYMBOL(dswitch)
