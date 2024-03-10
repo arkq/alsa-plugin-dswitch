@@ -20,10 +20,12 @@
  */
 
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
@@ -49,13 +51,16 @@ struct ioplug_data {
 	snd_pcm_uframes_t io_hw_ptr;
 	snd_pcm_uframes_t io_appl_ptr;
 
+	/* thread which periodically checks for PCM availability */
+	pthread_t worker_tid;
+	int worker_event_fd;
+
 };
 
 static const char *devices[] = {
 	"bluealsa",
 	"plughw:CARD=Device,DEV=0",
 	"plughw:CARD=PCH,DEV=0",
-	"default",
 	"null",
 };
 
@@ -158,6 +163,55 @@ static int supervise_current_pcm(struct ioplug_data *ioplug, int err) {
 	return -ENODEV;
 }
 
+void *worker(void *userdata) {
+	struct ioplug_data *ioplug = userdata;
+
+	struct pollfd fds[1] = {{ .fd = ioplug->worker_event_fd, .events = POLLIN }};
+	eventfd_t ev;
+
+	for (;;) {
+
+		/* check for new PCM every 2 seconds */
+		if (poll(fds, 1, 2000) != 0) {
+			eventfd_read(ioplug->worker_event_fd, &ev);
+			break;
+		}
+
+		pthread_mutex_lock(&ioplug->mutex);
+
+		debug("Checking PCM availability");
+
+		const char *currnet = ioplug->pcm != NULL ? snd_pcm_name(ioplug->pcm) : "NULL";
+		for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+
+			/* check PCMs with higher priority than the current one */
+			if (strcmp(devices[i], currnet) == 0)
+				break;
+
+			snd_pcm_t *pcm;
+			int rv;
+
+			if ((rv = pcm_open(ioplug, &pcm, devices[i], ioplug->io.stream, 0)) != 0) {
+				debug("pcm_open(%s): %s", devices[i], snd_strerror(rv));
+				continue;
+			}
+
+			if (ioplug->pcm != NULL)
+				snd_pcm_close(ioplug->pcm);
+
+			debug("Switching to PCM with higher priority: %s", devices[i]);
+			ioplug->pcm = pcm;
+			break;
+
+		}
+
+		pthread_mutex_unlock(&ioplug->mutex);
+
+	}
+
+	return NULL;
+}
+
 static int cb_start(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 
@@ -168,6 +222,8 @@ static int cb_start(snd_pcm_ioplug_t *io) {
 
 	rv = supervise_current_pcm(ioplug, 0);
 	debug("pcm=%s", ioplug->pcm != NULL ? snd_pcm_name(ioplug->pcm) : "NULL");
+
+	pthread_create(&ioplug->worker_tid, NULL, worker, ioplug);
 
 	if (rv == 0) {
 		const void *buffer = snd_pcm_channel_area_addr(&ioplug->io_hw_area, 0);
@@ -182,14 +238,19 @@ static int cb_start(snd_pcm_ioplug_t *io) {
 static int cb_stop(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
-	int rv = 0;
+
 	pthread_mutex_lock(&ioplug->mutex);
+
+	eventfd_write(ioplug->worker_event_fd, 1);
+	pthread_join(ioplug->worker_tid, NULL);
+
 	if (ioplug->pcm != NULL) {
 		snd_pcm_close(ioplug->pcm);
 		ioplug->pcm = NULL;
 	}
+
 	pthread_mutex_unlock(&ioplug->mutex);
-	return rv;
+	return 0;
 }
 
 static snd_pcm_sframes_t cb_pointer(snd_pcm_ioplug_t *io) {
@@ -242,6 +303,7 @@ static int cb_close(snd_pcm_ioplug_t *io) {
 	snd_pcm_sw_params_free(ioplug->sw_params);
 	snd_pcm_hw_params_free(ioplug->hw_params);
 	pthread_mutex_destroy(&ioplug->mutex);
+	close(ioplug->worker_event_fd);
 	free(ioplug);
 	return 0;
 }
@@ -503,6 +565,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	ioplug->io.poll_fd = -1;
 	ioplug->io.callback = &callback;
 	ioplug->io.private_data = ioplug;
+	ioplug->worker_event_fd = -1;
 
 	pthread_mutex_init(&ioplug->mutex, NULL);
 
@@ -510,24 +573,25 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 		goto fail;
 	if ((rv = snd_pcm_sw_params_malloc(&ioplug->sw_params)) < 0)
 		goto fail;
+	if ((ioplug->worker_event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) < 0) {
+		rv = -errno;
+		goto fail;
+	}
 
 	debug("Creating IO plug: ioplug=%p name=%s stream=%d mode=%d",
 			ioplug, name, stream, mode);
 	if ((rv = snd_pcm_ioplug_create(&ioplug->io, name, stream, mode)) < 0)
 		goto fail;
-	if ((rv = set_hw_constraint(ioplug)) < 0)
+	if ((rv = set_hw_constraint(ioplug)) < 0) {
+		snd_pcm_ioplug_delete(&ioplug->io);
 		goto fail;
+	}
 
 	*pcmp = ioplug->io.pcm;
 	return 0;
 
 fail:
-	if (ioplug->io.pcm != NULL)
-		snd_pcm_ioplug_delete(&ioplug->io);
-	snd_pcm_sw_params_free(ioplug->sw_params);
-	snd_pcm_hw_params_free(ioplug->hw_params);
-	pthread_mutex_destroy(&ioplug->mutex);
-	free(ioplug);
+	cb_close(&ioplug->io);
 	return rv;
 }
 
