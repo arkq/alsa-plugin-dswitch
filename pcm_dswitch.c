@@ -560,14 +560,14 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 			snd_config_for_each(it, it_next, n) {
 				const char *device = NULL;
 				snd_config_t *entry = snd_config_iterator_entry(it);
-				if (snd_config_get_string(entry, &device) < 0) {
+				if (snd_config_get_string(entry, &device) == 0) {
+					devices = realloc(devices, ++num_devices * sizeof(char*));
+					devices[num_devices - 1] = strdup(device);
+				}
+				else {
 					snd_config_get_id(entry, &id);
 					SNDERR("Invalid device: %s", id);
-					free(devices);
-					return -EINVAL;
 				}
-				devices = realloc(devices, ++num_devices * sizeof(char*));
-				devices[num_devices -1] = strdup(device);
 			}
 			continue;
 		}
