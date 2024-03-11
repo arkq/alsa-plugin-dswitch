@@ -538,6 +538,11 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	struct ioplug_data *ioplug;
 	int rv;
 
+	if (stream != SND_PCM_STREAM_PLAYBACK) {
+		SNDERR("The dswitch plugin supports only playback streams");
+		return -EINVAL;
+	}
+
 	snd_config_iterator_t pos, next;
 	snd_config_for_each(pos, next, conf) {
 		snd_config_t *n = snd_config_iterator_entry(pos);
