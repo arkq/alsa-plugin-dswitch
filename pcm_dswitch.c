@@ -57,12 +57,8 @@ struct ioplug_data {
 
 };
 
-static const char *devices[] = {
-	"bluealsa",
-	"plughw:CARD=Device,DEV=0",
-	"plughw:CARD=PCH,DEV=0",
-	"null",
-};
+static char **devices = NULL;
+static unsigned num_devices = 0;
 
 static int set_hw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 
@@ -144,7 +140,7 @@ static int supervise_current_pcm(struct ioplug_data *ioplug, int err) {
 		ioplug->pcm = NULL;
 	}
 
-	for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+	for (size_t i = 0; i < num_devices; i++) {
 
 		snd_pcm_t *pcm;
 		int rv;
@@ -182,7 +178,7 @@ void *worker(void *userdata) {
 		debug("Checking PCM availability");
 
 		const char *currnet = ioplug->pcm != NULL ? snd_pcm_name(ioplug->pcm) : "NULL";
-		for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+		for (size_t i = 0; i < num_devices; i++) {
 
 			/* check PCMs with higher priority than the current one */
 			if (strcmp(devices[i], currnet) == 0)
@@ -305,6 +301,9 @@ static int cb_close(snd_pcm_ioplug_t *io) {
 	pthread_mutex_destroy(&ioplug->mutex);
 	close(ioplug->worker_event_fd);
 	free(ioplug);
+	for (size_t i = 0; i < num_devices; i++)
+		free(devices[i]);
+	free(devices);
 	return 0;
 }
 
@@ -552,9 +551,32 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 				strcmp(id, "hint") == 0)
 			continue;
 
+		if (strcmp(id, "devices") == 0) {
+			if (!snd_config_is_array(n)) {
+				SNDERR("Invalid type for %s", id);
+				return -EINVAL;
+			}
+			snd_config_iterator_t it, it_next;
+			snd_config_for_each(it, it_next, n) {
+				const char *device = NULL;
+				snd_config_t *entry = snd_config_iterator_entry(it);
+				if (snd_config_get_string(entry, &device) < 0) {
+					snd_config_get_id(entry, &id);
+					SNDERR("Invalid device: %s", id);
+					free(devices);
+					return -EINVAL;
+				}
+				devices = realloc(devices, ++num_devices * sizeof(char*));
+				devices[num_devices -1] = strdup(device);
+			}
+			continue;
+		}
 		SNDERR("Unknown field %s", id);
 		return -EINVAL;
 	}
+
+	devices = realloc(devices, ++num_devices * sizeof(char*));
+	devices[num_devices - 1] = strdup("null");
 
 	if ((ioplug = calloc(1, sizeof(*ioplug))) == NULL)
 		return -ENOMEM;
