@@ -461,9 +461,18 @@ static int cb_set_chmap(snd_pcm_ioplug_t *io, const snd_pcm_chmap_t *map) {
 static void cb_dump(snd_pcm_ioplug_t *io, snd_output_t *out) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug("out=%p", out);
+	snd_output_printf(out, "Direct Device Switching PCM\n");
 	pthread_mutex_lock(&ioplug->mutex);
-	if (ioplug->pcm != NULL)
-		snd_pcm_dump(ioplug->pcm, out);
+	if (snd_pcm_state(io->pcm) >= SND_PCM_STATE_SETUP) {
+		snd_output_printf(out, "Its setup is:\n");
+		snd_pcm_dump_setup(io->pcm, out);
+		snd_output_printf(out, "Current Device: ");
+		if (ioplug->pcm != NULL) {
+			snd_pcm_dump(ioplug->pcm, out);
+		}
+		else
+			snd_output_printf(out, "<None>\n");
+	}
 	pthread_mutex_unlock(&ioplug->mutex);
 }
 
