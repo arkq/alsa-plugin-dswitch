@@ -367,6 +367,8 @@ static int cb_drain(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
 	int rv = 0;
+	if (io->nonblock)
+		return -EAGAIN;
 	pthread_mutex_lock(&ioplug->mutex);
 	if (ioplug->pcm != NULL) {
 		rv = snd_pcm_drain(ioplug->pcm);
