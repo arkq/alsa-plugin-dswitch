@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 
 #include <alsa/asoundlib.h>
@@ -39,6 +40,10 @@ struct ioplug_data {
 	pthread_mutex_t mutex;
 	/* currently used PCM */
 	snd_pcm_t *pcm;
+
+	/* PCM poll descriptors returned by snd_pcm_poll_descriptors() */
+	struct pollfd *pcm_pollfds;
+	size_t pcm_pollfds_count;
 
 	/* configuration passed to this plug-in */
 	snd_pcm_hw_params_t *hw_params;
@@ -129,6 +134,46 @@ static int pcm_open(const struct ioplug_data *ioplug, snd_pcm_t **pcm,
 	return 0;
 }
 
+static void set_current_pcm(struct ioplug_data *ioplug, snd_pcm_t *pcm) {
+
+	/* make sure we do not leak any resources */
+	if (ioplug->pcm != NULL) {
+
+		snd_pcm_close(ioplug->pcm);
+
+		/* remove PCM file descriptors from the epoll */
+		for (size_t i = 0; i < ioplug->pcm_pollfds_count; i++)
+			epoll_ctl(ioplug->io.poll_fd, EPOLL_CTL_DEL, ioplug->pcm_pollfds[i].fd, NULL);
+
+		free(ioplug->pcm_pollfds);
+		ioplug->pcm_pollfds = NULL;
+		ioplug->pcm_pollfds_count = 0;
+
+	}
+
+	ioplug->pcm = pcm;
+
+	if (pcm != NULL) {
+
+		/* update poll descriptors */
+		ioplug->pcm_pollfds_count = snd_pcm_poll_descriptors_count(pcm);
+		/* TODO: Handle memory allocation failure */
+		ioplug->pcm_pollfds = malloc(ioplug->pcm_pollfds_count * sizeof(*ioplug->pcm_pollfds));
+		snd_pcm_poll_descriptors(pcm, ioplug->pcm_pollfds, ioplug->pcm_pollfds_count);
+
+		/* add PCM file descriptors to the epoll */
+		for (size_t i = 0; i < ioplug->pcm_pollfds_count; i++) {
+			struct epoll_event ev = {
+				.events = ioplug->pcm_pollfds[i].events,
+				.data.fd = ioplug->pcm_pollfds[i].fd };
+			/* TODO: Add proper error handling */
+			epoll_ctl(ioplug->io.poll_fd, EPOLL_CTL_ADD, ioplug->pcm_pollfds[i].fd, &ev);
+		}
+
+	}
+
+}
+
 static int supervise_current_pcm(struct ioplug_data *ioplug, int err) {
 
 	if (ioplug->pcm != NULL) {
@@ -136,8 +181,7 @@ static int supervise_current_pcm(struct ioplug_data *ioplug, int err) {
 		if (err != -ENODEV)
 			return err;
 		debug("pcm=%s: %s", snd_pcm_name(ioplug->pcm), snd_strerror(err));
-		snd_pcm_close(ioplug->pcm);
-		ioplug->pcm = NULL;
+		set_current_pcm(ioplug, NULL);
 	}
 
 	for (size_t i = 0; i < num_devices; i++) {
@@ -150,7 +194,7 @@ static int supervise_current_pcm(struct ioplug_data *ioplug, int err) {
 			continue;
 		}
 
-		ioplug->pcm = pcm;
+		set_current_pcm(ioplug, pcm);
 		return 0;
 
 	}
@@ -192,11 +236,8 @@ void *worker(void *userdata) {
 				continue;
 			}
 
-			if (ioplug->pcm != NULL)
-				snd_pcm_close(ioplug->pcm);
-
 			debug("Switching to PCM with higher priority: %s", devices[i]);
-			ioplug->pcm = pcm;
+			set_current_pcm(ioplug, pcm);
 			break;
 
 		}
@@ -240,10 +281,7 @@ static int cb_stop(snd_pcm_ioplug_t *io) {
 	eventfd_write(ioplug->worker_event_fd, 1);
 	pthread_join(ioplug->worker_tid, NULL);
 
-	if (ioplug->pcm != NULL) {
-		snd_pcm_close(ioplug->pcm);
-		ioplug->pcm = NULL;
-	}
+	set_current_pcm(ioplug, NULL);
 
 	pthread_mutex_unlock(&ioplug->mutex);
 	return 0;
@@ -300,6 +338,8 @@ static int cb_close(snd_pcm_ioplug_t *io) {
 	snd_pcm_hw_params_free(ioplug->hw_params);
 	pthread_mutex_destroy(&ioplug->mutex);
 	close(ioplug->worker_event_fd);
+	if (ioplug->io.poll_fd != -1)
+		close(ioplug->io.poll_fd);
 	free(ioplug);
 	for (size_t i = 0; i < num_devices; i++)
 		free(devices[i]);
@@ -418,27 +458,25 @@ static int cb_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
 	return rv;
 }
 
-#if 0
-
-static int cb_poll_descriptors_count(snd_pcm_ioplug_t *io) {
-	struct ioplug_data *ioplug = io->private_data;
-	debug();
-	return 0;
-}
-
-static int cb_poll_descriptors(snd_pcm_ioplug_t *io,
-		struct pollfd *pfds, unsigned int nfds) {
-	struct ioplug_data *ioplug = io->private_data;
-	debug("pfds=%p nfds=%u", pfds, nfds);
-	return 0;
-}
-
 static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 		struct pollfd *pfds, unsigned int nfds, unsigned short *revents) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug("pfds=%p nfds=%u revents=%p", pfds, nfds, revents);
-	return 0;
+	int rv = 0;
+	*revents = 0;
+	pthread_mutex_lock(&ioplug->mutex);
+	if (ioplug->pcm != NULL) {
+		for (size_t i = 0; i < ioplug->pcm_pollfds_count; i++)
+			ioplug->pcm_pollfds[i].revents = 0;
+		poll(ioplug->pcm_pollfds, ioplug->pcm_pollfds_count, 0);
+		rv = snd_pcm_poll_descriptors_revents(ioplug->pcm,
+				ioplug->pcm_pollfds, ioplug->pcm_pollfds_count, revents);
+	}
+	pthread_mutex_unlock(&ioplug->mutex);
+	return rv;
 }
+
+#if 0
 
 static snd_pcm_chmap_query_t **cb_query_chmaps(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
@@ -492,10 +530,13 @@ static const snd_pcm_ioplug_callback_t callback = {
 	.pause = cb_pause,
 	.resume = cb_resume,
 	.delay = cb_delay,
-#if 0
-	.poll_descriptors_count = cb_poll_descriptors_count,
-	.poll_descriptors = cb_poll_descriptors,
+	/* These two callbacks are not required because this plug-in sets
+	 * the `poll_fd` and `poll_events` fields of the ioplug structure.
+	 *  .poll_descriptors_count =
+	 *  .poll_descriptors =
+	 */
 	.poll_revents = cb_poll_descriptors_revents,
+#if 0
 	.query_chmaps = cb_query_chmaps,
 	.get_chmap = cb_get_chmap,
 	.set_chmap = cb_set_chmap,
@@ -601,6 +642,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	ioplug->io.name = "PCM Dynamic Switch Plugin";
 	ioplug->io.flags = SND_PCM_IOPLUG_FLAG_LISTED;
 	ioplug->io.poll_fd = -1;
+	ioplug->io.poll_events = POLLIN;
 	ioplug->io.callback = &callback;
 	ioplug->io.private_data = ioplug;
 	ioplug->worker_event_fd = -1;
@@ -610,6 +652,8 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	if ((rv = snd_pcm_hw_params_malloc(&ioplug->hw_params)) < 0)
 		goto fail;
 	if ((rv = snd_pcm_sw_params_malloc(&ioplug->sw_params)) < 0)
+		goto fail;
+	if ((ioplug->io.poll_fd = epoll_create1(EPOLL_CLOEXEC)) == -1)
 		goto fail;
 	if ((ioplug->worker_event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) < 0) {
 		rv = -errno;
