@@ -276,14 +276,13 @@ static int cb_stop(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
 
-	pthread_mutex_lock(&ioplug->mutex);
-
 	eventfd_write(ioplug->worker_event_fd, 1);
 	pthread_join(ioplug->worker_tid, NULL);
 
+	pthread_mutex_lock(&ioplug->mutex);
 	set_current_pcm(ioplug, NULL);
-
 	pthread_mutex_unlock(&ioplug->mutex);
+
 	return 0;
 }
 
