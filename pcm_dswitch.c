@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,7 @@ struct ioplug_data {
 
 	/* thread which periodically checks for PCM availability */
 	pthread_t worker_tid;
+	bool worker_running;
 	int worker_event_fd;
 
 };
@@ -257,17 +259,23 @@ static int cb_start(snd_pcm_ioplug_t *io) {
 
 	pthread_mutex_lock(&ioplug->mutex);
 
-	rv = supervise_current_pcm(ioplug, 0);
-	debug("pcm=%s", ioplug->pcm != NULL ? snd_pcm_name(ioplug->pcm) : "NULL");
+	if ((rv = supervise_current_pcm(ioplug, 0)) != 0)
+		goto final;
+	debug("pcm=%s", snd_pcm_name(ioplug->pcm));
 
-	pthread_create(&ioplug->worker_tid, NULL, worker, ioplug);
+	/* Write all buffered frames to the new PCM. */
+	const void *buffer = snd_pcm_channel_area_addr(&ioplug->io_hw_area, 0);
+	if ((frames = snd_pcm_writei(ioplug->pcm, buffer, ioplug->io_appl_ptr)) > 0)
+		ioplug->io_hw_ptr = ioplug->io_hw_ptr + frames;
 
-	if (rv == 0) {
-		const void *buffer = snd_pcm_channel_area_addr(&ioplug->io_hw_area, 0);
-		if ((frames = snd_pcm_writei(ioplug->pcm, buffer, ioplug->io_appl_ptr)) > 0)
-			ioplug->io_hw_ptr = ioplug->io_hw_ptr + frames;
+	if ((rv = -pthread_create(&ioplug->worker_tid, NULL, worker, ioplug)) != 0) {
+		set_current_pcm(ioplug, NULL);
+		goto final;
 	}
 
+	ioplug->worker_running = true;
+
+final:
 	pthread_mutex_unlock(&ioplug->mutex);
 	return rv;
 }
@@ -276,8 +284,11 @@ static int cb_stop(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
 
-	eventfd_write(ioplug->worker_event_fd, 1);
-	pthread_join(ioplug->worker_tid, NULL);
+	if (ioplug->worker_running) {
+		eventfd_write(ioplug->worker_event_fd, 1);
+		pthread_join(ioplug->worker_tid, NULL);
+		ioplug->worker_running = false;
+	}
 
 	pthread_mutex_lock(&ioplug->mutex);
 	set_current_pcm(ioplug, NULL);
