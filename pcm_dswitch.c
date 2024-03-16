@@ -115,6 +115,12 @@ static int device_list_add_from_config(struct dswitch_device_list *list, const s
 			SNDERR("Invalid device: %s", id);
 			return -EINVAL;
 		}
+		snd_config_t *definition = NULL;
+		if (snd_config_search_definition(snd_config, "pcm", device, &definition) < 0) {
+			SNDERR("No such PCM device '%s'", device);
+			return -EINVAL;
+		}
+		snd_config_delete(definition);
 		if (device_list_add_from_string(list, device) != 0) {
 			SNDERR("Out of memory");
 			return -ENOMEM;
