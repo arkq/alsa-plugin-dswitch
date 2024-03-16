@@ -35,6 +35,11 @@
 #define debug(M, ...) \
 	fprintf(stderr, "%s:%u: " M "\n", __func__, __LINE__, ##__VA_ARGS__)
 
+struct dswitch_device_list {
+	char **list;
+	size_t count;
+};
+
 struct ioplug_data {
 	snd_pcm_ioplug_t io;
 
@@ -62,10 +67,68 @@ struct ioplug_data {
 	bool worker_running;
 	int worker_event_fd;
 
+	struct dswitch_device_list devices;
 };
 
-static char **devices = NULL;
-static unsigned num_devices = 0;
+static int device_list_init(struct dswitch_device_list *list) {
+	if ((list->list = malloc(sizeof(*(list->list)))) == NULL)
+		return -ENOMEM;
+	list->list[0] = NULL;
+	list->count = 1;
+	return 0;
+}
+
+static void string_list_free(char **list, size_t count) {
+	for (size_t i = 0; i < count; i++)
+		free(list[i]);
+	free(list);
+}
+
+static void device_list_free(struct dswitch_device_list *list) {
+	string_list_free(list->list, list->count);
+	list->list = NULL;
+	list->count = 0;
+}
+
+static int device_list_add_from_string(struct dswitch_device_list *list, const char *device) {
+	char **temp;
+	if ((temp = realloc(list->list, (list->count + 1) * sizeof(*(list->list)))) == NULL) {
+		return 1;
+	}
+	if ((temp[list->count - 1] = strdup(device)) == NULL) {
+		string_list_free(temp, list->count);
+		return -ENOMEM;
+	}
+	list->list = temp;
+	list->count++;
+	return 0;
+}
+
+static int device_list_add_from_config(struct dswitch_device_list *list, const snd_config_t *devices_config) {
+	snd_config_iterator_t it, it_next;
+	snd_config_for_each(it, it_next, devices_config) {
+		const char *device = NULL;
+		snd_config_t *entry = snd_config_iterator_entry(it);
+		if (snd_config_get_string(entry, &device) != 0) {
+			const char* id;
+			snd_config_get_id(entry, &id);
+			SNDERR("Invalid device: %s", id);
+			return -EINVAL;
+		}
+		if (device_list_add_from_string(list, device) != 0) {
+			SNDERR("Out of memory");
+			return -ENOMEM;
+		}
+	}
+	return 0;
+}
+
+static int device_list_complete(struct dswitch_device_list *list) {
+	if ((list->list[list->count - 1] = strdup("null")) == NULL)
+		return -ENOMEM;
+	return 0;
+
+}
 
 static int set_hw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 
@@ -186,13 +249,13 @@ static int supervise_current_pcm(struct ioplug_data *ioplug, int err) {
 		set_current_pcm(ioplug, NULL);
 	}
 
-	for (size_t i = 0; i < num_devices; i++) {
+	for (size_t i = 0; i < ioplug->devices.count; i++) {
 
 		snd_pcm_t *pcm;
 		int rv;
 
-		if ((rv = pcm_open(ioplug, &pcm, devices[i], ioplug->io.stream, 0)) != 0) {
-			debug("pcm_open(%s): %s", devices[i], snd_strerror(rv));
+		if ((rv = pcm_open(ioplug, &pcm, ioplug->devices.list[i], ioplug->io.stream, 0)) != 0) {
+			debug("pcm_open(%s): %s", ioplug->devices.list[i], snd_strerror(rv));
 			continue;
 		}
 
@@ -224,21 +287,21 @@ void *worker(void *userdata) {
 		debug("Checking PCM availability");
 
 		const char *currnet = ioplug->pcm != NULL ? snd_pcm_name(ioplug->pcm) : "NULL";
-		for (size_t i = 0; i < num_devices; i++) {
+		for (size_t i = 0; i < ioplug->devices.count; i++) {
 
 			/* check PCMs with higher priority than the current one */
-			if (strcmp(devices[i], currnet) == 0)
+			if (strcmp(ioplug->devices.list[i], currnet) == 0)
 				break;
 
 			snd_pcm_t *pcm;
 			int rv;
 
-			if ((rv = pcm_open(ioplug, &pcm, devices[i], ioplug->io.stream, 0)) != 0) {
-				debug("pcm_open(%s): %s", devices[i], snd_strerror(rv));
+			if ((rv = pcm_open(ioplug, &pcm, ioplug->devices.list[i], ioplug->io.stream, 0)) != 0) {
+				debug("pcm_open(%s): %s", ioplug->devices.list[i], snd_strerror(rv));
 				continue;
 			}
 
-			debug("Switching to PCM with higher priority: %s", devices[i]);
+			debug("Switching to PCM with higher priority: %s", ioplug->devices.list[i]);
 			set_current_pcm(ioplug, pcm);
 			break;
 
@@ -350,10 +413,8 @@ static int cb_close(snd_pcm_ioplug_t *io) {
 	close(ioplug->worker_event_fd);
 	if (ioplug->io.poll_fd != -1)
 		close(ioplug->io.poll_fd);
+	device_list_free(&ioplug->devices);
 	free(ioplug);
-	for (size_t i = 0; i < num_devices; i++)
-		free(devices[i]);
-	free(devices);
 	return 0;
 }
 
@@ -598,11 +659,17 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	(void)root;
 
 	struct ioplug_data *ioplug;
+	struct dswitch_device_list device_list;
 	int rv;
 
 	if (stream != SND_PCM_STREAM_PLAYBACK) {
 		SNDERR("The dswitch plugin supports only playback streams");
 		return -EINVAL;
+	}
+
+	if ((rv = device_list_init(&device_list)) < 0) {
+		SNDERR("Out of memory");
+		return rv;
 	}
 
 	snd_config_iterator_t pos, next;
@@ -623,30 +690,25 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 				SNDERR("Invalid type for %s", id);
 				return -EINVAL;
 			}
-			snd_config_iterator_t it, it_next;
-			snd_config_for_each(it, it_next, n) {
-				const char *device = NULL;
-				snd_config_t *entry = snd_config_iterator_entry(it);
-				if (snd_config_get_string(entry, &device) == 0) {
-					devices = realloc(devices, ++num_devices * sizeof(char*));
-					devices[num_devices - 1] = strdup(device);
-				}
-				else {
-					snd_config_get_id(entry, &id);
-					SNDERR("Invalid device: %s", id);
-				}
+			if ((rv = device_list_add_from_config(&device_list, n)) < 0) {
+				device_list_free(&device_list);
+				return rv;
 			}
 			continue;
 		}
 		SNDERR("Unknown field %s", id);
+		device_list_free(&device_list);
 		return -EINVAL;
 	}
-
-	devices = realloc(devices, ++num_devices * sizeof(char*));
-	devices[num_devices - 1] = strdup("null");
-
-	if ((ioplug = calloc(1, sizeof(*ioplug))) == NULL)
+	if ((rv = device_list_complete(&device_list)) < 0) {
+		device_list_free(&device_list);
 		return -ENOMEM;
+	}
+
+	if ((ioplug = calloc(1, sizeof(*ioplug))) == NULL) {
+		device_list_free(&device_list);
+		return -ENOMEM;
+	}
 
 	ioplug->io.version = SND_PCM_IOPLUG_VERSION;
 	ioplug->io.name = "PCM Dynamic Switch Plugin";
@@ -656,6 +718,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	ioplug->io.callback = &callback;
 	ioplug->io.private_data = ioplug;
 	ioplug->worker_event_fd = -1;
+	ioplug->devices = device_list;
 
 	pthread_mutex_init(&ioplug->mutex, NULL);
 
