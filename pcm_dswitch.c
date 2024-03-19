@@ -78,6 +78,9 @@ struct ioplug_data {
 	snd_pcm_uframes_t io_hw_ptr;
 	snd_pcm_uframes_t io_appl_ptr;
 
+	/* eventfd to prompt application when no pcm yet selected */
+	int appl_event_fd;
+
 	/* thread which periodically checks for PCM availability */
 	pthread_t worker_tid;
 	bool worker_running;
@@ -269,6 +272,10 @@ static void set_current_pcm(struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 			epoll_ctl(ioplug->io.poll_fd, EPOLL_CTL_ADD, ioplug->pcm_pollfds[i].fd, &ev);
 		}
 
+		/* clear any appl_event_fd poll event */
+		eventfd_t event;
+		eventfd_read(ioplug->appl_event_fd, &event);
+
 	}
 
 }
@@ -404,6 +411,8 @@ static int cb_stop(snd_pcm_ioplug_t *io) {
 		snd_pcm_drop(ioplug->pcm);
 		set_current_pcm(ioplug, NULL);
 	}
+
+	eventfd_write(ioplug->appl_event_fd, 1);
 	pthread_mutex_unlock(&ioplug->mutex);
 
 	return 0;
@@ -459,6 +468,7 @@ static int cb_close(snd_pcm_ioplug_t *io) {
 	snd_pcm_sw_params_free(ioplug->sw_params);
 	snd_pcm_hw_params_free(ioplug->hw_params);
 	pthread_mutex_destroy(&ioplug->mutex);
+	close(ioplug->appl_event_fd);
 	close(ioplug->worker_event_fd);
 	if (ioplug->io.poll_fd != -1)
 		close(ioplug->io.poll_fd);
@@ -522,6 +532,7 @@ static int cb_prepare(snd_pcm_ioplug_t *io) {
 	debug();
 	ioplug->io_hw_ptr = 0;
 	ioplug->io_appl_ptr = 0;
+	eventfd_write(ioplug->appl_event_fd, 1);
 	return 0;
 }
 
@@ -598,6 +609,12 @@ static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 	debug("pfds=%p nfds=%u revents=%p", pfds, nfds, revents);
 	int rv = 0;
 	*revents = 0;
+
+	if (pfds[0].fd != io->poll_fd || nfds != 1) {
+		debug("invalid poll descriptors");
+		return -EINVAL;
+	}
+
 	pthread_mutex_lock(&ioplug->mutex);
 	if (ioplug->pcm != NULL) {
 		for (size_t i = 0; i < ioplug->pcm_pollfds_count; i++)
@@ -605,25 +622,48 @@ static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 		poll(ioplug->pcm_pollfds, ioplug->pcm_pollfds_count, 0);
 		rv = snd_pcm_poll_descriptors_revents(ioplug->pcm,
 				ioplug->pcm_pollfds, ioplug->pcm_pollfds_count, revents);
+		if (*revents & (POLLERR | POLLHUP | POLLNVAL))
+			*revents = 0;
 	}
+	else {
+		struct pollfd pfd = { ioplug->appl_event_fd, POLLIN, 0 };
+		if ((rv = poll(&pfd, 1, 0)) == 1 && pfd.revents & POLLIN) {
+			eventfd_t event;
+			eventfd_read(ioplug->appl_event_fd, &event);
+			*revents &= ~(POLLIN | POLLOUT);
+			switch (io->state) {
+			case SND_PCM_STATE_PREPARED:
+				*revents |= POLLOUT;
+				eventfd_write(ioplug->appl_event_fd, 1);
+				break;
+			default:
+				break;
+			}
+		}
+	}
+
 	/* For non-blocking drain, we clear the POLLOUT flag until the pcm
 	 * underruns */
-	if (io->state == SND_PCM_STATE_DRAINING) {
+	if (rv == 0 && io->state == SND_PCM_STATE_DRAINING) {
 		switch (snd_pcm_state(ioplug->pcm)) {
 		case SND_PCM_STATE_SETUP:
 			/* In case non-blocking was enabled for drain disable it here */
 			if (ioplug->pcm != NULL && io->nonblock)
 				snd_pcm_nonblock(ioplug->pcm, 0);
-			/* Setting the hw_ptr to -1 causes ioplug to drop the stream */
-			ioplug->io_hw_ptr = -1;
+			/* We must explicitly set the plugin state here, otherwise some
+			* applications using non-blocking mode (eg MPD) get stuck draining
+			* forever. */
+			snd_pcm_ioplug_set_state(io, SND_PCM_STATE_SETUP);
 			*revents |= POLLOUT;
 			break;
 		case SND_PCM_STATE_RUNNING:
+		case SND_PCM_STATE_DRAINING:
 			*revents &= ~POLLOUT;
 			break;
 		case SND_PCM_STATE_XRUN:
 			/* Setting the hw_ptr to -1 causes ioplug to drop the stream */
 			ioplug->io_hw_ptr = -1;
+			*revents |= POLLOUT;
 			break;
 		default:
 			*revents &= ~POLLOUT;
@@ -806,6 +846,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	ioplug->io.callback = &callback;
 	ioplug->io.private_data = ioplug;
 	ioplug->worker_event_fd = -1;
+	ioplug->appl_event_fd = -1;
 	ioplug->devices = device_list;
 
 	pthread_mutex_init(&ioplug->mutex, NULL);
@@ -820,6 +861,15 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 		rv = -errno;
 		goto fail;
 	}
+	if ((ioplug->appl_event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) < 0) {
+		rv = -errno;
+		goto fail;
+	}
+	struct epoll_event ev = {
+		.events = POLLIN,
+		.data.fd = ioplug->appl_event_fd };
+	/* TODO: Add proper error handling */
+	epoll_ctl(ioplug->io.poll_fd, EPOLL_CTL_ADD, ioplug->appl_event_fd, &ev);
 
 	debug("Creating IO plug: ioplug=%p name=%s stream=%d mode=%d",
 			ioplug, name, stream, mode);
