@@ -137,6 +137,7 @@ static int set_hw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 	unsigned int channels;
 	unsigned int periods;
 	unsigned int rate;
+	snd_pcm_uframes_t buffer_size;
 	int rv;
 
 	snd_pcm_hw_params_t *params;
@@ -153,11 +154,20 @@ static int set_hw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 	if ((rv = snd_pcm_hw_params_get_channels(ioplug->hw_params, &channels)) != 0 ||
 			(rv = snd_pcm_hw_params_set_channels(pcm, params, channels)) != 0)
 		return rv;
+	if ((rv = snd_pcm_hw_params_get_rate(ioplug->hw_params, &rate, NULL)) != 0 ||
+			(rv = snd_pcm_hw_params_set_rate(pcm, params, rate, 0)) != 0)
+		return rv;
 	if ((rv = snd_pcm_hw_params_get_periods(ioplug->hw_params, &periods, NULL)) != 0 ||
 			(rv = snd_pcm_hw_params_set_periods(pcm, params, periods, 0)) != 0)
 		return rv;
-	if ((rv = snd_pcm_hw_params_get_rate(ioplug->hw_params, &rate, NULL)) != 0 ||
-			(rv = snd_pcm_hw_params_set_rate(pcm, params, rate, 0)) != 0)
+	/* The period and buffer sizes cannot be guaranteed across device changes,
+	 * because some (eg `dmix`) enforce a fixed period time, others default
+	 * to buffer_size_max or period_size_max. etc. In an effort to limit the
+	 * latency, we request a buffer size near to the application's requested
+	 * size, but allow the device to choose its own "best" values from that
+	 * request. */
+	if ((rv = snd_pcm_hw_params_get_buffer_size(ioplug->hw_params, &buffer_size)) != 0 ||
+			(rv = snd_pcm_hw_params_set_buffer_size_near(pcm, params, &buffer_size)) != 0)
 		return rv;
 
 	return snd_pcm_hw_params(pcm, params);
@@ -173,8 +183,16 @@ static int set_sw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 
 	if ((rv = snd_pcm_sw_params_current(pcm, params)) != 0)
 		return rv;
-	if ((rv = snd_pcm_sw_params_get_start_threshold(ioplug->sw_params, &threshold)) != 0 ||
-			(rv = snd_pcm_sw_params_set_start_threshold(pcm, params, threshold)) != 0)
+
+	/* We must ensure that the PCM start threshold is less than its buffer size,
+	 * otherwise it will never start */
+	if ((rv = snd_pcm_sw_params_get_start_threshold(ioplug->sw_params, &threshold)) != 0)
+		return rv;
+	snd_pcm_uframes_t buffer_size, period_size;
+	snd_pcm_get_params(pcm, &buffer_size, &period_size);
+	if (threshold > buffer_size)
+		threshold = buffer_size;
+	if ((rv = snd_pcm_sw_params_set_start_threshold(pcm, params, threshold)) != 0)
 		return rv;
 
 	return snd_pcm_sw_params(pcm, params);
@@ -471,6 +489,8 @@ static int cb_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params) {
 static int cb_prepare(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
+	ioplug->io_hw_ptr = 0;
+	ioplug->io_appl_ptr = 0;
 	return 0;
 }
 
@@ -485,6 +505,9 @@ static int cb_drain(snd_pcm_ioplug_t *io) {
 		rv = snd_pcm_drain(ioplug->pcm);
 		rv = supervise_current_pcm(ioplug, rv);
 	}
+	else
+		ioplug->io_hw_ptr = ioplug->io_appl_ptr;
+
 	pthread_mutex_unlock(&ioplug->mutex);
 	return rv;
 }
@@ -525,6 +548,15 @@ static int cb_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
 		rv = snd_pcm_delay(ioplug->pcm, delayp);
 		rv = supervise_current_pcm(ioplug, rv);
 	}
+	else {
+		snd_pcm_sframes_t delay;
+		delay = snd_pcm_ioplug_hw_avail(io, ioplug->io_hw_ptr, io->appl_ptr);
+		if (delay >= 0)
+			*delayp = delay;
+		else
+			rv = (int) delay;
+	}
+
 	pthread_mutex_unlock(&ioplug->mutex);
 	return rv;
 }
