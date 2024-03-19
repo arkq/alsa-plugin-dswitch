@@ -575,6 +575,21 @@ static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 		rv = snd_pcm_poll_descriptors_revents(ioplug->pcm,
 				ioplug->pcm_pollfds, ioplug->pcm_pollfds_count, revents);
 	}
+	/* For non-blocking drain, we clear the POLLOUT flag until the pcm
+	 * underruns */
+	if (io->state == SND_PCM_STATE_DRAINING) {
+		switch (snd_pcm_state(ioplug->pcm)) {
+		case SND_PCM_STATE_RUNNING:
+			*revents &= ~POLLOUT;
+			break;
+		case SND_PCM_STATE_XRUN:
+			snd_pcm_drop(ioplug->pcm);
+			break;
+		default:
+			break;
+		}
+	}
+
 	pthread_mutex_unlock(&ioplug->mutex);
 	return rv;
 }
