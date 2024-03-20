@@ -372,7 +372,11 @@ static int cb_stop(snd_pcm_ioplug_t *io) {
 	}
 
 	pthread_mutex_lock(&ioplug->mutex);
-	set_current_pcm(ioplug, NULL);
+
+	if (ioplug->pcm != NULL) {
+		snd_pcm_drop(ioplug->pcm);
+		set_current_pcm(ioplug, NULL);
+	}
 	pthread_mutex_unlock(&ioplug->mutex);
 
 	return 0;
@@ -498,10 +502,10 @@ static int cb_drain(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
 	int rv = 0;
-	if (io->nonblock)
-		return -EAGAIN;
 	pthread_mutex_lock(&ioplug->mutex);
 	if (ioplug->pcm != NULL) {
+		if (io->nonblock)
+			snd_pcm_nonblock(ioplug->pcm, 1);
 		rv = snd_pcm_drain(ioplug->pcm);
 		rv = supervise_current_pcm(ioplug, rv);
 	}
@@ -579,13 +583,23 @@ static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 	 * underruns */
 	if (io->state == SND_PCM_STATE_DRAINING) {
 		switch (snd_pcm_state(ioplug->pcm)) {
+		case SND_PCM_STATE_SETUP:
+			/* In case non-blocking was enabled for drain disable it here */
+			if (ioplug->pcm != NULL && io->nonblock)
+				snd_pcm_nonblock(ioplug->pcm, 0);
+			/* Setting the hw_ptr to -1 causes ioplug to drop the stream */
+			ioplug->io_hw_ptr = -1;
+			*revents |= POLLOUT;
+			break;
 		case SND_PCM_STATE_RUNNING:
 			*revents &= ~POLLOUT;
 			break;
 		case SND_PCM_STATE_XRUN:
-			snd_pcm_drop(ioplug->pcm);
+			/* Setting the hw_ptr to -1 causes ioplug to drop the stream */
+			ioplug->io_hw_ptr = -1;
 			break;
 		default:
+			*revents &= ~POLLOUT;
 			break;
 		}
 	}
