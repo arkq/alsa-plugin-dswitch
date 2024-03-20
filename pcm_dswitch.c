@@ -466,7 +466,7 @@ static int cb_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params) {
 	ioplug->hw_format = format;
 	ioplug->io_hw_boundary = size;
 	ioplug->io_hw_area.addr = malloc(snd_pcm_format_size(format, size * channels));
-	ioplug->io_hw_area.step = snd_pcm_format_width(format) * channels;
+	ioplug->io_hw_area.step = snd_pcm_format_physical_width(format) * channels;
 	ioplug->io_hw_area.first = 0;
 
 	ioplug->io_hw_ptr = 0;
