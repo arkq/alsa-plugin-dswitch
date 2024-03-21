@@ -32,8 +32,24 @@
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
 
-#define debug(M, ...) \
+#ifndef NDEBUG
+# define debug(M, ...) \
 	fprintf(stderr, "%s:%u: " M "\n", __func__, __LINE__, ##__VA_ARGS__)
+#else
+# define debug(M, ...) \
+	do {} while (0);
+#endif
+
+/* For disabling ALSA logging from the worker thread */
+static void disable_alsa_error_logging(const char *file, int line,
+				const char *func, int err, const char *fmt, va_list arg) {
+	(void) file;
+	(void) line;
+	(void) func;
+	(void) err;
+	(void) fmt;
+	(void) arg;
+}
 
 struct dswitch_device_list {
 	char **list;
@@ -267,6 +283,9 @@ static int supervise_current_pcm(struct ioplug_data *ioplug, int err) {
 		set_current_pcm(ioplug, NULL);
 	}
 
+	/* temporarily disable ALSA error logging */
+
+	snd_local_error_handler_t err_func = snd_lib_error_set_local(disable_alsa_error_logging);
 	for (size_t i = 0; i < ioplug->devices.count; i++) {
 
 		snd_pcm_t *pcm;
@@ -277,6 +296,7 @@ static int supervise_current_pcm(struct ioplug_data *ioplug, int err) {
 			continue;
 		}
 
+		snd_lib_error_set_local(err_func);
 		set_current_pcm(ioplug, pcm);
 		return 0;
 
@@ -291,6 +311,13 @@ void *worker(void *userdata) {
 
 	struct pollfd fds[1] = {{ .fd = ioplug->worker_event_fd, .events = POLLIN }};
 	eventfd_t ev;
+
+	/* Disable ALSA error logging for this thread only, because we expect the
+	* call to snd_pcm_open() to fail most times. Note that the local thread
+	* limitation requires that the compiler, and platform, supports the
+	* gcc __thread storage class keyword. Without that support this call
+	* disables ALSA error logging in all threads.  */
+	snd_lib_error_set_local(disable_alsa_error_logging);
 
 	for (;;) {
 
