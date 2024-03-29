@@ -554,19 +554,6 @@ static int cb_drain(snd_pcm_ioplug_t *io) {
 	return rv;
 }
 
-static int cb_pause(snd_pcm_ioplug_t *io, int enable) {
-	struct ioplug_data *ioplug = io->private_data;
-	debug("enable=%d", enable);
-	int rv = 0;
-	pthread_mutex_lock(&ioplug->mutex);
-	if (ioplug->pcm != NULL) {
-		rv = snd_pcm_pause(ioplug->pcm, enable);
-		rv = supervise_current_pcm(ioplug, rv);
-	}
-	pthread_mutex_unlock(&ioplug->mutex);
-	return rv;
-}
-
 static int cb_resume(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
@@ -726,7 +713,6 @@ static const snd_pcm_ioplug_callback_t callback = {
 	.sw_params = cb_sw_params,
 	.prepare = cb_prepare,
 	.drain = cb_drain,
-	.pause = cb_pause,
 	.resume = cb_resume,
 	.delay = cb_delay,
 	/* These two callbacks are not required because this plug-in sets
