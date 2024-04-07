@@ -40,17 +40,6 @@
 	do {} while (0);
 #endif
 
-/* For disabling ALSA logging from the worker thread */
-static void disable_alsa_error_logging(const char *file, int line,
-				const char *func, int err, const char *fmt, va_list arg) {
-	(void) file;
-	(void) line;
-	(void) func;
-	(void) err;
-	(void) fmt;
-	(void) arg;
-}
-
 struct dswitch_device_list {
 	char **list;
 	size_t count;
@@ -62,6 +51,7 @@ struct ioplug_data {
 	pthread_mutex_t mutex;
 	/* currently used PCM */
 	snd_pcm_t *pcm;
+	snd_pcm_uframes_t pcm_buffer_size;
 
 	/* PCM poll descriptors returned by snd_pcm_poll_descriptors() */
 	struct pollfd *pcm_pollfds;
@@ -75,7 +65,7 @@ struct ioplug_data {
 	/* fake ring buffer to make IO-plug happy */
 	snd_pcm_channel_area_t io_hw_area;
 	snd_pcm_uframes_t io_hw_boundary;
-	snd_pcm_uframes_t io_hw_ptr;
+	snd_pcm_sframes_t io_hw_ptr;
 	snd_pcm_uframes_t io_appl_ptr;
 
 	/* eventfd to prompt application when no pcm yet selected */
@@ -88,6 +78,17 @@ struct ioplug_data {
 
 	struct dswitch_device_list devices;
 };
+
+/* For disabling ALSA logging */
+static void disable_alsa_error_logging(const char *file, int line,
+				const char *func, int err, const char *fmt, va_list arg) {
+	(void) file;
+	(void) line;
+	(void) func;
+	(void) err;
+	(void) fmt;
+	(void) arg;
+}
 
 static int device_list_init(struct dswitch_device_list *list) {
 	if ((list->list = malloc(sizeof(*(list->list)))) == NULL)
@@ -156,7 +157,8 @@ static int set_hw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 	unsigned int channels;
 	unsigned int periods;
 	unsigned int rate;
-	snd_pcm_uframes_t buffer_size;
+	snd_pcm_uframes_t period_size;
+	int dir;
 	int rv;
 
 	snd_pcm_hw_params_t *params;
@@ -176,25 +178,32 @@ static int set_hw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 	if ((rv = snd_pcm_hw_params_get_rate(ioplug->hw_params, &rate, NULL)) != 0 ||
 			(rv = snd_pcm_hw_params_set_rate(pcm, params, rate, 0)) != 0)
 		return rv;
-	if ((rv = snd_pcm_hw_params_get_periods(ioplug->hw_params, &periods, NULL)) != 0 ||
-			(rv = snd_pcm_hw_params_set_periods(pcm, params, periods, 0)) != 0)
-		return rv;
 	/* The period and buffer sizes cannot be guaranteed across device changes,
 	 * because some (eg `dmix`) enforce a fixed period time, others default
 	 * to buffer_size_max or period_size_max. etc. In an effort to limit the
-	 * latency, we request a buffer size near to the application's requested
-	 * size, but allow the device to choose its own "best" values from that
-	 * request. */
-	if ((rv = snd_pcm_hw_params_get_buffer_size(ioplug->hw_params, &buffer_size)) != 0 ||
-			(rv = snd_pcm_hw_params_set_buffer_size_near(pcm, params, &buffer_size)) != 0)
+	 * latency, we request a period time near to, but  not greater than, the
+	 * application's requested time, and allow the device to choose its own
+	 * "best" value from that request. */
+	unsigned int period_time;
+	if ((rv = snd_pcm_hw_params_get_period_time(ioplug->hw_params, &period_time, &dir)) != 0)
 		return rv;
-
+	if ((rv = snd_pcm_hw_params_set_period_time(pcm, params, period_time, dir)) != 0) {
+		/* If the requested time cannot be set, try setting the period size */
+		if ((rv = snd_pcm_hw_params_get_period_size(ioplug->hw_params, &period_size, &dir)) != 0)
+			return rv;
+		dir = -1;
+		if ((rv = snd_pcm_hw_params_set_period_size_near(pcm, params, &period_size, &dir)) != 0)
+			return rv;
+	}
+	if ((rv = snd_pcm_hw_params_get_periods(ioplug->hw_params, &periods, NULL)) != 0 ||
+			(rv = snd_pcm_hw_params_set_periods(pcm, params, periods, 0)) != 0)
+		return rv;
 	return snd_pcm_hw_params(pcm, params);
 }
 
 static int set_sw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 
-	snd_pcm_uframes_t threshold;
+	snd_pcm_uframes_t buffer_size, period_size, value;
 	int rv;
 
 	snd_pcm_sw_params_t *params;
@@ -203,15 +212,22 @@ static int set_sw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 	if ((rv = snd_pcm_sw_params_current(pcm, params)) != 0)
 		return rv;
 
+	snd_pcm_get_params(pcm, &buffer_size, &period_size);
+
 	/* We must ensure that the PCM start threshold is less than its buffer size,
 	 * otherwise it will never start */
-	if ((rv = snd_pcm_sw_params_get_start_threshold(ioplug->sw_params, &threshold)) != 0)
+	if ((rv = snd_pcm_sw_params_get_start_threshold(ioplug->sw_params, &value)) != 0)
 		return rv;
-	snd_pcm_uframes_t buffer_size, period_size;
-	snd_pcm_get_params(pcm, &buffer_size, &period_size);
-	if (threshold > buffer_size)
-		threshold = buffer_size;
-	if ((rv = snd_pcm_sw_params_set_start_threshold(pcm, params, threshold)) != 0)
+	if (value > buffer_size)
+		value = buffer_size;
+	if ((rv = snd_pcm_sw_params_set_start_threshold(pcm, params, value)) != 0)
+		return rv;
+
+	/* We ensure avail_min is not less than the ioplug period_size */
+	if ((rv = snd_pcm_sw_params_get_avail_min(params, &value)) != 0)
+		return rv;
+	if (value < ioplug->io.period_size &&
+			(rv = snd_pcm_sw_params_set_avail_min(pcm, params, ioplug->io.period_size)) != 0)
 		return rv;
 
 	return snd_pcm_sw_params(pcm, params);
@@ -276,6 +292,9 @@ static void set_current_pcm(struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 		eventfd_t event;
 		eventfd_read(ioplug->appl_event_fd, &event);
 
+		snd_pcm_uframes_t period_size;
+		snd_pcm_get_params(pcm, &ioplug->pcm_buffer_size, &period_size);
+
 	}
 
 }
@@ -291,8 +310,8 @@ static int supervise_current_pcm(struct ioplug_data *ioplug, int err) {
 	}
 
 	/* temporarily disable ALSA error logging */
-
 	snd_local_error_handler_t err_func = snd_lib_error_set_local(disable_alsa_error_logging);
+
 	for (size_t i = 0; i < ioplug->devices.count; i++) {
 
 		snd_pcm_t *pcm;
@@ -338,11 +357,11 @@ void *worker(void *userdata) {
 
 		debug("Checking PCM availability");
 
-		const char *currnet = ioplug->pcm != NULL ? snd_pcm_name(ioplug->pcm) : "NULL";
+		const char *current = ioplug->pcm != NULL ? snd_pcm_name(ioplug->pcm) : "NULL";
 		for (size_t i = 0; i < ioplug->devices.count; i++) {
 
 			/* check PCMs with higher priority than the current one */
-			if (strcmp(ioplug->devices.list[i], currnet) == 0)
+			if (strcmp(ioplug->devices.list[i], current) == 0)
 				break;
 
 			snd_pcm_t *pcm;
@@ -381,7 +400,7 @@ static int cb_start(snd_pcm_ioplug_t *io) {
 	/* Write all buffered frames to the new PCM. */
 	const void *buffer = snd_pcm_channel_area_addr(&ioplug->io_hw_area, 0);
 	if ((frames = snd_pcm_writei(ioplug->pcm, buffer, ioplug->io_appl_ptr)) > 0)
-		ioplug->io_hw_ptr = ioplug->io_hw_ptr + frames;
+		ioplug->io_hw_ptr += frames;
 
 	if ((rv = -pthread_create(&ioplug->worker_tid, NULL, worker, ioplug)) != 0) {
 		set_current_pcm(ioplug, NULL);
@@ -421,7 +440,17 @@ static int cb_stop(snd_pcm_ioplug_t *io) {
 static snd_pcm_sframes_t cb_pointer(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug("appl=%zu hw=%zu", ioplug->io_appl_ptr, ioplug->io_hw_ptr);
-	return ioplug->io_hw_ptr;
+	if (ioplug->pcm == NULL || ioplug->io_hw_ptr == -1)
+		return ioplug->io_hw_ptr;
+
+	snd_pcm_sframes_t pcm_avail = snd_pcm_avail(ioplug->pcm);
+	if (pcm_avail < 0 || (snd_pcm_uframes_t)pcm_avail > ioplug->pcm_buffer_size)
+		return -1;
+
+	if (pcm_avail + io->appl_ptr < ioplug->pcm_buffer_size)
+		return io->hw_ptr;
+
+	return (pcm_avail + io->appl_ptr - ioplug->pcm_buffer_size) % ioplug->io_hw_boundary;
 }
 
 static snd_pcm_sframes_t cb_transfer(snd_pcm_ioplug_t *io,
@@ -501,7 +530,6 @@ static int cb_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params) {
 			format, channels, periods, size);
 
 	ioplug->hw_format = format;
-	ioplug->io_hw_boundary = size;
 	ioplug->io_hw_area.addr = malloc(snd_pcm_format_size(format, size * channels));
 	ioplug->io_hw_area.step = snd_pcm_format_physical_width(format) * channels;
 	ioplug->io_hw_area.first = 0;
@@ -516,14 +544,14 @@ static int cb_hw_free(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
 	free(ioplug->io_hw_area.addr);
-	ioplug->io_hw_boundary = 0;
 	return 0;
 }
 
 static int cb_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params) {
 	struct ioplug_data *ioplug = io->private_data;
-	snd_pcm_sw_params_copy(ioplug->sw_params, params);
 	debug("params=%p", params);
+	snd_pcm_sw_params_copy(ioplug->sw_params, params);
+	snd_pcm_sw_params_get_boundary(params, &ioplug->io_hw_boundary);
 	return 0;
 }
 
@@ -603,24 +631,31 @@ static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 	}
 
 	pthread_mutex_lock(&ioplug->mutex);
+
+	eventfd_t appl_event = 0;
+	struct pollfd pfd = { ioplug->appl_event_fd, POLLIN, 0 };
+	if ((rv = poll(&pfd, 1, 0)) == 1 && pfd.revents & POLLIN)
+		eventfd_read(ioplug->appl_event_fd, &appl_event);
+
 	if (ioplug->pcm != NULL) {
 		for (size_t i = 0; i < ioplug->pcm_pollfds_count; i++)
 			ioplug->pcm_pollfds[i].revents = 0;
 		poll(ioplug->pcm_pollfds, ioplug->pcm_pollfds_count, 0);
 		rv = snd_pcm_poll_descriptors_revents(ioplug->pcm,
 				ioplug->pcm_pollfds, ioplug->pcm_pollfds_count, revents);
-		if (*revents & (POLLERR | POLLHUP | POLLNVAL))
+		if (rv == -ENODEV) {
 			*revents = 0;
+			rv = supervise_current_pcm(ioplug, rv);
+			goto finish;
+		}
+		if (*revents & (POLLHUP | POLLNVAL))
+			*revents = POLLOUT | POLLERR;
 	}
 	else {
-		struct pollfd pfd = { ioplug->appl_event_fd, POLLIN, 0 };
-		if ((rv = poll(&pfd, 1, 0)) == 1 && pfd.revents & POLLIN) {
-			eventfd_t event;
-			eventfd_read(ioplug->appl_event_fd, &event);
-			*revents &= ~(POLLIN | POLLOUT);
+		if (appl_event != 0) {
 			switch (io->state) {
 			case SND_PCM_STATE_PREPARED:
-				*revents |= POLLOUT;
+				*revents = POLLOUT;
 				eventfd_write(ioplug->appl_event_fd, 1);
 				break;
 			default:
@@ -657,6 +692,8 @@ static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 			break;
 		}
 	}
+
+finish:
 
 	pthread_mutex_unlock(&ioplug->mutex);
 	return rv;
@@ -827,6 +864,9 @@ SND_PCM_PLUGIN_DEFINE_FUNC(dswitch) {
 	ioplug->io.version = SND_PCM_IOPLUG_VERSION;
 	ioplug->io.name = "PCM Dynamic Switch Plugin";
 	ioplug->io.flags = SND_PCM_IOPLUG_FLAG_LISTED;
+#ifdef SND_PCM_IOPLUG_FLAG_BOUNDARY_WA
+	ioplug->io.flags |= SND_PCM_IOPLUG_FLAG_BOUNDARY_WA;
+#endif
 	ioplug->io.poll_fd = -1;
 	ioplug->io.poll_events = POLLIN;
 	ioplug->io.callback = &callback;
