@@ -157,6 +157,7 @@ static int set_hw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 	unsigned int channels;
 	unsigned int periods;
 	unsigned int rate;
+	unsigned int period_time;
 	snd_pcm_uframes_t period_size;
 	int dir;
 	int rv;
@@ -184,7 +185,7 @@ static int set_hw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 	 * latency, we request a period time near to, but  not greater than, the
 	 * application's requested time, and allow the device to choose its own
 	 * "best" value from that request. */
-	unsigned int period_time;
+	dir = -1;
 	if ((rv = snd_pcm_hw_params_get_period_time(ioplug->hw_params, &period_time, &dir)) != 0)
 		return rv;
 	if ((rv = snd_pcm_hw_params_set_period_time(pcm, params, period_time, dir)) != 0) {
@@ -221,13 +222,6 @@ static int set_sw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 	if (value > buffer_size)
 		value = buffer_size;
 	if ((rv = snd_pcm_sw_params_set_start_threshold(pcm, params, value)) != 0)
-		return rv;
-
-	/* We ensure avail_min is not less than the ioplug period_size */
-	if ((rv = snd_pcm_sw_params_get_avail_min(params, &value)) != 0)
-		return rv;
-	if (value < ioplug->io.period_size &&
-			(rv = snd_pcm_sw_params_set_avail_min(pcm, params, ioplug->io.period_size)) != 0)
 		return rv;
 
 	return snd_pcm_sw_params(pcm, params);
