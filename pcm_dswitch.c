@@ -556,6 +556,8 @@ static int cb_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params) {
 static int cb_prepare(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
+	if (ioplug->pcm != NULL)
+		snd_pcm_prepare(ioplug->pcm);
 	ioplug->io_hw_ptr = 0;
 	ioplug->io_appl_ptr = 0;
 	eventfd_write(ioplug->appl_event_fd, 1);
