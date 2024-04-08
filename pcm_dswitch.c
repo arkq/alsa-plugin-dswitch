@@ -437,6 +437,10 @@ static snd_pcm_sframes_t cb_pointer(snd_pcm_ioplug_t *io) {
 	if (ioplug->pcm == NULL || ioplug->io_hw_ptr == -1)
 		return ioplug->io_hw_ptr;
 
+	/* To prevent the ALSA ioplug from erroneously reporting XRUN state */
+	if (io->state < SND_PCM_STATE_RUNNING || io->state > SND_PCM_STATE_DRAINING)
+		return 0;
+
 	snd_pcm_sframes_t pcm_avail = snd_pcm_avail(ioplug->pcm);
 	if (pcm_avail < 0 || (snd_pcm_uframes_t)pcm_avail > ioplug->pcm_buffer_size)
 		return -1;
@@ -634,7 +638,9 @@ static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 	if (ioplug->pcm != NULL) {
 		for (size_t i = 0; i < ioplug->pcm_pollfds_count; i++)
 			ioplug->pcm_pollfds[i].revents = 0;
-		poll(ioplug->pcm_pollfds, ioplug->pcm_pollfds_count, 0);
+		if ((rv = poll(ioplug->pcm_pollfds, ioplug->pcm_pollfds_count, 0)) == 0)
+			goto finish;
+
 		rv = snd_pcm_poll_descriptors_revents(ioplug->pcm,
 				ioplug->pcm_pollfds, ioplug->pcm_pollfds_count, revents);
 		if (rv == -ENODEV) {
@@ -642,8 +648,10 @@ static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 			rv = supervise_current_pcm(ioplug, rv);
 			goto finish;
 		}
-		if (*revents & (POLLHUP | POLLNVAL))
+		if (*revents & (POLLHUP | POLLNVAL)) {
 			*revents = POLLOUT | POLLERR;
+			goto finish;
+		}
 	}
 	else {
 		if (appl_event != 0) {
@@ -670,7 +678,7 @@ static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 			* applications using non-blocking mode (eg MPD) get stuck draining
 			* forever. */
 			snd_pcm_ioplug_set_state(io, SND_PCM_STATE_SETUP);
-			*revents |= POLLOUT;
+			*revents = POLLOUT;
 			break;
 		case SND_PCM_STATE_RUNNING:
 		case SND_PCM_STATE_DRAINING:
@@ -679,7 +687,7 @@ static int cb_poll_descriptors_revents(snd_pcm_ioplug_t *io,
 		case SND_PCM_STATE_XRUN:
 			/* Setting the hw_ptr to -1 causes ioplug to drop the stream */
 			ioplug->io_hw_ptr = -1;
-			*revents |= POLLOUT;
+			*revents |= (POLLOUT|POLLERR);
 			break;
 		default:
 			*revents &= ~POLLOUT;
