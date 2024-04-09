@@ -441,14 +441,21 @@ static snd_pcm_sframes_t cb_pointer(snd_pcm_ioplug_t *io) {
 	if (io->state < SND_PCM_STATE_RUNNING || io->state > SND_PCM_STATE_DRAINING)
 		return 0;
 
+	pthread_mutex_lock(&ioplug->mutex);
+
+	snd_pcm_sframes_t hw_ptr;
 	snd_pcm_sframes_t pcm_avail = snd_pcm_avail(ioplug->pcm);
 	if (pcm_avail < 0 || (snd_pcm_uframes_t)pcm_avail > ioplug->pcm_buffer_size)
-		return -1;
+		hw_ptr = -1;
 
-	if (pcm_avail + io->appl_ptr < ioplug->pcm_buffer_size)
-		return io->hw_ptr;
+	else if (pcm_avail + io->appl_ptr < ioplug->pcm_buffer_size)
+		hw_ptr = io->hw_ptr;
 
-	return (pcm_avail + io->appl_ptr - ioplug->pcm_buffer_size) % ioplug->io_hw_boundary;
+	else
+		hw_ptr = (pcm_avail + io->appl_ptr - ioplug->pcm_buffer_size) % ioplug->io_hw_boundary;
+
+	pthread_mutex_unlock(&ioplug->mutex);
+	return hw_ptr;
 }
 
 static snd_pcm_sframes_t cb_transfer(snd_pcm_ioplug_t *io,
@@ -556,11 +563,13 @@ static int cb_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params) {
 static int cb_prepare(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
 	debug();
+	pthread_mutex_lock(&ioplug->mutex);
 	if (ioplug->pcm != NULL)
 		snd_pcm_prepare(ioplug->pcm);
 	ioplug->io_hw_ptr = 0;
 	ioplug->io_appl_ptr = 0;
 	eventfd_write(ioplug->appl_event_fd, 1);
+	pthread_mutex_unlock(&ioplug->mutex);
 	return 0;
 }
 
