@@ -203,19 +203,18 @@ static int set_hw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 
 static int set_sw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 	(void) ioplug;
-	snd_pcm_uframes_t value;
+	snd_pcm_uframes_t buffer_size, period_size;
 	int rv;
-
 	snd_pcm_sw_params_t *params;
-	snd_pcm_sw_params_alloca(&params);
 
+	snd_pcm_sw_params_alloca(&params);
 	if ((rv = snd_pcm_sw_params_current(pcm, params)) != 0)
 		return rv;
 
-	/* Disable automatic PCM start */
-	if ((rv = snd_pcm_sw_params_get_boundary(params, &value)) != 0)
-		return rv;
-	if ((rv = snd_pcm_sw_params_set_start_threshold(pcm, params, value)) != 0)
+	snd_pcm_get_params(pcm, &buffer_size, &period_size);
+
+	/* Do not automatically start PCM unless its buffer is full */
+	if ((rv = snd_pcm_sw_params_set_start_threshold(pcm, params, buffer_size)) != 0)
 		return rv;
 
 	return snd_pcm_sw_params(pcm, params);
@@ -389,10 +388,11 @@ static int cb_start(snd_pcm_ioplug_t *io) {
 	const void *buffer = snd_pcm_channel_area_addr(&ioplug->io_hw_area, 0);
 	if ((frames = snd_pcm_writei(ioplug->pcm, buffer, io->appl_ptr)) > 0)
 		ioplug->io_hw_ptr += frames;
-	if ((rv = snd_pcm_start(ioplug->pcm)) != 0) {
-		set_current_pcm(ioplug, NULL);
-		goto final;
-	}
+	if (snd_pcm_state(ioplug->pcm) == SND_PCM_STATE_PREPARED)
+		if ((rv = snd_pcm_start(ioplug->pcm)) != 0) {
+			set_current_pcm(ioplug, NULL);
+			goto final;
+		}
 
 	if ((rv = -pthread_create(&ioplug->worker_tid, NULL, worker, ioplug)) != 0) {
 		set_current_pcm(ioplug, NULL);
