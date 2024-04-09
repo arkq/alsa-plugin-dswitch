@@ -66,7 +66,6 @@ struct ioplug_data {
 	snd_pcm_channel_area_t io_hw_area;
 	snd_pcm_uframes_t io_hw_boundary;
 	snd_pcm_sframes_t io_hw_ptr;
-	snd_pcm_uframes_t io_appl_ptr;
 
 	/* eventfd to prompt application when no pcm yet selected */
 	int appl_event_fd;
@@ -203,8 +202,8 @@ static int set_hw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 }
 
 static int set_sw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
-
-	snd_pcm_uframes_t buffer_size, period_size, value;
+	(void) ioplug;
+	snd_pcm_uframes_t value;
 	int rv;
 
 	snd_pcm_sw_params_t *params;
@@ -213,14 +212,9 @@ static int set_sw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 	if ((rv = snd_pcm_sw_params_current(pcm, params)) != 0)
 		return rv;
 
-	snd_pcm_get_params(pcm, &buffer_size, &period_size);
-
-	/* We must ensure that the PCM start threshold is less than its buffer size,
-	 * otherwise it will never start */
-	if ((rv = snd_pcm_sw_params_get_start_threshold(ioplug->sw_params, &value)) != 0)
+	/* Disable automatic PCM start */
+	if ((rv = snd_pcm_sw_params_get_boundary(params, &value)) != 0)
 		return rv;
-	if (value > buffer_size)
-		value = buffer_size;
 	if ((rv = snd_pcm_sw_params_set_start_threshold(pcm, params, value)) != 0)
 		return rv;
 
@@ -393,8 +387,12 @@ static int cb_start(snd_pcm_ioplug_t *io) {
 
 	/* Write all buffered frames to the new PCM. */
 	const void *buffer = snd_pcm_channel_area_addr(&ioplug->io_hw_area, 0);
-	if ((frames = snd_pcm_writei(ioplug->pcm, buffer, ioplug->io_appl_ptr)) > 0)
+	if ((frames = snd_pcm_writei(ioplug->pcm, buffer, io->appl_ptr)) > 0)
 		ioplug->io_hw_ptr += frames;
+	if ((rv = snd_pcm_start(ioplug->pcm)) != 0) {
+		set_current_pcm(ioplug, NULL);
+		goto final;
+	}
 
 	if ((rv = -pthread_create(&ioplug->worker_tid, NULL, worker, ioplug)) != 0) {
 		set_current_pcm(ioplug, NULL);
@@ -433,7 +431,7 @@ static int cb_stop(snd_pcm_ioplug_t *io) {
 
 static snd_pcm_sframes_t cb_pointer(snd_pcm_ioplug_t *io) {
 	struct ioplug_data *ioplug = io->private_data;
-	debug("appl=%zu hw=%zu", ioplug->io_appl_ptr, ioplug->io_hw_ptr);
+	debug("appl=%zu hw=%zu", io->appl_ptr, ioplug->io_hw_ptr);
 	if (ioplug->pcm == NULL || ioplug->io_hw_ptr == -1)
 		return ioplug->io_hw_ptr;
 
@@ -449,7 +447,7 @@ static snd_pcm_sframes_t cb_pointer(snd_pcm_ioplug_t *io) {
 		hw_ptr = -1;
 
 	else if (pcm_avail + io->appl_ptr < ioplug->pcm_buffer_size)
-		hw_ptr = io->hw_ptr;
+		hw_ptr = ioplug->io_hw_ptr;
 
 	else
 		hw_ptr = (pcm_avail + io->appl_ptr - ioplug->pcm_buffer_size) % ioplug->io_hw_boundary;
@@ -473,9 +471,8 @@ static snd_pcm_sframes_t cb_transfer(snd_pcm_ioplug_t *io,
 	if (ioplug->pcm == NULL) {
 		/* If target PCM is not opened yet, store incoming frames
 		 * in our local ring buffer. */
-		snd_pcm_area_copy(&ioplug->io_hw_area, ioplug->io_appl_ptr,
+		snd_pcm_area_copy(&ioplug->io_hw_area, io->appl_ptr,
 		      area, offset, frames, ioplug->hw_format);
-		ioplug->io_appl_ptr += frames;
 		goto final;
 	}
 
@@ -539,8 +536,7 @@ static int cb_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params) {
 	ioplug->io_hw_area.step = snd_pcm_format_physical_width(format) * channels;
 	ioplug->io_hw_area.first = 0;
 
-	ioplug->io_hw_ptr = 0;
-	ioplug->io_appl_ptr = 0;
+	ioplug->io_hw_ptr = io->hw_ptr;
 
 	return 0;
 }
@@ -566,8 +562,7 @@ static int cb_prepare(snd_pcm_ioplug_t *io) {
 	pthread_mutex_lock(&ioplug->mutex);
 	if (ioplug->pcm != NULL)
 		snd_pcm_prepare(ioplug->pcm);
-	ioplug->io_hw_ptr = 0;
-	ioplug->io_appl_ptr = 0;
+	ioplug->io_hw_ptr = io->hw_ptr;
 	eventfd_write(ioplug->appl_event_fd, 1);
 	pthread_mutex_unlock(&ioplug->mutex);
 	return 0;
@@ -585,7 +580,7 @@ static int cb_drain(snd_pcm_ioplug_t *io) {
 		rv = supervise_current_pcm(ioplug, rv);
 	}
 	else
-		ioplug->io_hw_ptr = ioplug->io_appl_ptr;
+		ioplug->io_hw_ptr = io->appl_ptr;
 
 	pthread_mutex_unlock(&ioplug->mutex);
 	return rv;
