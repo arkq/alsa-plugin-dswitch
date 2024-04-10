@@ -202,7 +202,6 @@ static int set_hw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 }
 
 static int set_sw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
-	(void) ioplug;
 	snd_pcm_uframes_t buffer_size, period_size;
 	int rv;
 	snd_pcm_sw_params_t *params;
@@ -214,8 +213,9 @@ static int set_sw_params(const struct ioplug_data *ioplug, snd_pcm_t *pcm) {
 	snd_pcm_get_params(pcm, &buffer_size, &period_size);
 
 	/* Do not automatically start PCM unless its buffer is full */
-	if ((rv = snd_pcm_sw_params_set_start_threshold(pcm, params, buffer_size)) != 0)
-		return rv;
+	if (ioplug->io.state == SND_PCM_STATE_PREPARED)
+		if ((rv = snd_pcm_sw_params_set_start_threshold(pcm, params, buffer_size)) != 0)
+			return rv;
 
 	return snd_pcm_sw_params(pcm, params);
 }
